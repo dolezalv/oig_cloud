@@ -54,7 +54,7 @@ Wrong — general executor, **each warns**:
 | `custom_components/oig_cloud/oig_cloud_battery_forecast.py:14739` | `get_significant_states` | `self.hass` |
 | `custom_components/oig_cloud/balancing/core.py:429` | `statistics_during_period` | `self.hass` |
 | `custom_components/oig_cloud/oig_cloud_statistics.py:621` | `history.state_changes_during_period` | `self.hass` |
-| `custom_components/oig_cloud/oig_cloud_statistics.py:741` | `history.state_changes_during_period` | `self.hass` |
+| `custom_components/oig_cloud/oig_cloud_statistics.py:740` | `history.state_changes_during_period` | `self.hass` |
 
 **10 wrong sites total.** Note `12903`'s handle is a local
 `hass = self.hass or self._hass` (line 12889), not a parameter — preserve that
@@ -84,10 +84,19 @@ executor, mirroring the two correct sites:
 from homeassistant.components.recorder import get_instance
 ...
 recorder_instance = get_instance(<hass>)
-if recorder_instance is None:      # mirror adaptive_load_profiles.py's guard
-    return  # or skip the read, per the site's existing error path
 states = await recorder_instance.async_add_executor_job(<fn>, <hass>, ...)
 ```
+
+Recorder readiness is **already** handled at every one of these sites by their
+existing `try/except` blocks — and note that in current HA core
+`get_instance()` typically **raises `KeyError`** when the recorder isn't set up
+rather than returning `None`, so the `if … is None` guard
+`adaptive_load_profiles.py` uses is belt-and-suspenders, not the real readiness
+mechanism. So the minimal, behaviour-preserving change is just to swap the
+executor (rely on the existing `try/except`); adding a `None` guard is optional.
+If you do add one, **return the site's existing empty value, not a bare
+`return`** — e.g. at `12903` the enclosing function returns `[]` (a list
+contract), so use `return []` there, not `return None`.
 
 - Add the `get_instance` import in each scope that lacks it (these are local,
   in-function imports today; keep that style).
