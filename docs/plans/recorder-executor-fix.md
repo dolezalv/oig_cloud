@@ -51,9 +51,16 @@ Wrong — general executor, **each warns**:
 | `custom_components/oig_cloud/oig_cloud_battery_forecast.py:12903` | `statistics_during_period` | `hass` (param) |
 | `custom_components/oig_cloud/oig_cloud_battery_forecast.py:13131` | `history.get_significant_states` | `self.hass` |
 | `custom_components/oig_cloud/oig_cloud_battery_forecast.py:14673` | `get_significant_states` | `self.hass` |
+| `custom_components/oig_cloud/oig_cloud_battery_forecast.py:14739` | `get_significant_states` | `self.hass` |
 | `custom_components/oig_cloud/balancing/core.py:429` | `statistics_during_period` | `self.hass` |
 | `custom_components/oig_cloud/oig_cloud_statistics.py:621` | `history.state_changes_during_period` | `self.hass` |
 | `custom_components/oig_cloud/oig_cloud_statistics.py:741` | `history.state_changes_during_period` | `self.hass` |
+
+**10 wrong sites total.** Note `12903`'s handle is a local
+`hass = self.hass or self._hass` (line 12889), not a parameter — preserve that
+fallback when wrapping: `get_instance(hass)`. Note `14673` and `14739` are both
+inside `_try_load_last_month_from_history` (a rare month-boundary path) — see
+verification M1 handling below.
 
 Already correct — the template for the fix:
 
@@ -76,13 +83,25 @@ executor, mirroring the two correct sites:
 ```python
 from homeassistant.components.recorder import get_instance
 ...
-states = await get_instance(<hass>).async_add_executor_job(<fn>, <hass>, ...)
+recorder_instance = get_instance(<hass>)
+if recorder_instance is None:      # mirror adaptive_load_profiles.py's guard
+    return  # or skip the read, per the site's existing error path
+states = await recorder_instance.async_add_executor_job(<fn>, <hass>, ...)
 ```
 
 - Add the `get_instance` import in each scope that lacks it (these are local,
   in-function imports today; keep that style).
-- Use the **exact** hass handle at each site (`self.hass`, `self._hass`, or the
-  `hass` parameter) — they differ per call.
+- `get_instance` is re-exported from **both** `homeassistant.components.recorder`
+  and `homeassistant.helpers.recorder`; the repo's two correct templates use
+  *different* ones (`profiler.py` → `helpers.recorder`; `battery_health.py` →
+  `components.recorder`). Either works — just do **not** import it from
+  `…recorder.history`. Match whichever the surrounding code already uses.
+- Use the **exact** hass handle at each site (`self.hass`, `self._hass`, or at
+  `12903` the local `hass = self.hass or self._hass`) — they differ per call;
+  a wrong handle raises `AttributeError`.
+- Mirror the existing `None`/readiness guard (`adaptive_load_profiles.py`
+  already does `if not recorder_instance`) so a not-yet-ready recorder degrades
+  gracefully instead of raising.
 - No behavioural/semantic change: same recorder function, same args, same
   result type. The only change is *which thread pool* runs it.
 
@@ -96,10 +115,10 @@ removes the warning **and** improves DB-access correctness.
 
 ## Risks / edge cases (attack these in review)
 
-1. **Import path** — `get_instance` lives in `homeassistant.components.recorder`
-   (top-level), while some sites import `history` from
-   `homeassistant.components.recorder.history`. Ensure the added import is the
-   correct module, not under `.history`.
+1. **Import path** — `get_instance` is re-exported from both
+   `homeassistant.components.recorder` and `homeassistant.helpers.recorder`
+   (the two correct templates in this repo use different ones). Either is fine;
+   just do not import it from `…recorder.history`.
 2. **Recorder readiness** — `get_instance(hass)` returns the recorder instance;
    if recorder is not yet set up, it can return `None`/raise. Are any of these
    call sites reachable before recorder setup (e.g. during early
@@ -122,13 +141,33 @@ removes the warning **and** improves DB-access correctness.
 
 ## Verification (executed in step 3, on the box)
 
-1. Apply the patch to the on-box copy; restart HA.
-2. Confirm oig_cloud loads: 0 new `ERROR`, forecast/statistics/balancing
-   sensors still update, boiler control + LG SmartThinQ still healthy.
-3. Measure the frame-warning rate over 5–10 min → expect **~0** (allow a small
-   one-time startup residue from any unconverted/early path).
-4. If residue remains, re-attribute (debug-log a window) before claiming done —
-   do not declare success on a partial drop.
+A plain elapsed-time window is **insufficient** and risks a false pass: the
+steady ~4/min flood comes from a *frequently-polled* site, but several wrong
+sites run only rarely (`14673`/`14739` month-boundary; the statistics
+"first calc after start"). A 5–10 min sample would never exercise those, so it
+could read ~0 while a rare path is still unconverted. So verification has two
+parts:
+
+1. **Apply + sanity.** Patch the on-box copy; restart HA. Confirm oig_cloud
+   loads: 0 new `ERROR`, forecast/statistics/balancing sensors still update,
+   boiler control + LG SmartThinQ still healthy.
+2. **Attribute the steady source FIRST (before patching is ideal).** Identify
+   which frequently-polled site produces the ~4/min steady stream — briefly
+   enable `custom_components.oig_cloud` debug logging and correlate the debug
+   line preceding each frame warning, or bisect by feature toggle. This pins the
+   dominant culprit so the steady-rate drop is attributable, not coincidental.
+3. **Steady-rate check.** After patching, measure the frame-warning rate over
+   ≥10 min → the steady stream must go to **0**.
+4. **Exercise the RARE paths explicitly** (do not wait for elapsed time):
+   trigger `_try_load_last_month_from_history` (`14673`/`14739`) and the
+   statistics daily/first-calc path (`621`/`741`) — e.g. reload the integration
+   / call the relevant service / temporarily shorten the schedule in a scratch
+   copy — and confirm **no** frame warning is emitted from those paths after the
+   fix. A site that cannot be triggered in test is called out explicitly as
+   "fixed-by-inspection, not exercised."
+5. If any residue remains, re-attribute before claiming done. Conversely, a ~0
+   steady reading is **not** sufficient on its own — the rare paths in step 4
+   must be checked, or the result is a false pass (per review M1).
 
 ## Delivery
 
